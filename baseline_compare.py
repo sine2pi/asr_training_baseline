@@ -1,35 +1,26 @@
 import os
 import time
 import logging
-import torch, torchaudio
-from torch import nn, Tensor
 from typing import Tuple, Optional, Dict, Union, Any, List
-from torch.utils.data import DataLoader
-import torchaudio.transforms as T
-
-from torch.nn import functional as F
-
 import gzip
 import base64
 from datetime import datetime
-# Data handling libraries
 import numpy as np
-
-# from torchaudio.transforms import MelSpectrogram
-from torch.nn.functional import scaled_dot_product_attention
-from torch.utils.tensorboard.writer import SummaryWriter
-
-# ML libraries
+from torch.utils.data import DataLoader
+from tqdm import tqdm
 import evaluate
 from datasets import load_dataset, Audio
 from transformers import WhisperFeatureExtractor, WhisperTokenizer
-from tqdm import tqdm
 from dataclasses import dataclass
-
+from torch.nn.functional import scaled_dot_product_attention
+from torch.utils.tensorboard.writer import SummaryWriter
+import torchaudio.transforms as T
+from torch.nn import functional as F
+import torch, torchaudio
+from torch import nn, Tensorimport torch, torchaudio
+from torch import nn, Tensor
 from contextlib import contextmanager
 from typing import Iterable
-
-
 from whisper.decoding import decode as decode_function
 from whisper.decoding import detect_language as detect_language_function
 from whisper.transcribe import transcribe as transcribe_function
