@@ -517,56 +517,76 @@ def compute_metrics(pred, tokenizer):
     wer = 100 * metric.compute(predictions=pred_str, references=label_str) # type: ignore
     return {"wer": wer}
 
-def train_and_evaluate(model, tokenizer, train_loader, eval_loader, optimizer, scheduler, loss_fn, 
-                      max_steps=10000, device='cuda', accumulation_steps=1, clear_cache=True, 
-                      log_interval=10, eval_interval=100, save_interval=1000, 
-                      checkpoint_dir="checkpoint_dir", log_dir="log_dir"):
+
+def train_and_evaluate(model, tokenizer, train_loader, eval_loader, optimizer, scheduler, loss_fn,
+                        max_steps=10000, device='cuda', accumulation_steps=1, clear_cache=True,
+                        log_interval=10, eval_interval=100, save_interval=1000,
+                        checkpoint_dir="checkpoint_dir", log_dir="log_dir"):
     model.to(device)
     global_step = 0
-    scaler = torch.GradScaler(device='cuda')
+    scaler = torch.GradScaler()
     writer = SummaryWriter(log_dir=log_dir)
     train_iterator = iter(train_loader)
     total_loss = 0
     step_in_report = 0
     dataset_epochs = 0
-    
-    progress_bar = tqdm(total=max_steps, desc="Training")
-    
+
+    progress_bar = tqdm(total=max_steps, desc="Training Progress", leave=True, colour='green')
+
     model.train()
     optimizer.zero_grad()
-    
+
+    profiler = torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+        schedule=torch.profiler.schedule(
+            wait=1,
+            warmup=1,
+            active=1,
+            repeat=1
+        ),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler(log_dir),
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True
+    )
+
+    profiler.start()
+
     while global_step < max_steps:
         try:
             batch = next(train_iterator)
         except StopIteration:
             train_iterator = iter(train_loader)
             batch = next(train_iterator)
-            
             dataset_epochs += 1
             print(f"Starting dataset epoch {dataset_epochs}")
-            
+
             if step_in_report > 0:
-                avg_loss = total_loss / step_in_report if step_in_report > 0 else 0
+                avg_loss = total_loss / step_in_report
                 logging.info(f"Dataset iteration complete - Steps: {global_step}, Avg Loss: {avg_loss:.4f}")
                 total_loss = 0
                 step_in_report = 0
-        
+
         start_time = time.time()
 
         input_features = batch['input_features'].to(device)
         input_ids = batch['input_ids'].to(device)
         labels = batch['labels'].long().to(device)
 
-        input_features_encoded = model.encoder(input_features)
-        decoder_output = model.decoder(input_ids, input_features_encoded)
-        logits = decoder_output.view(-1, decoder_output.size(-1))
-        active_logits = logits.view(-1, decoder_output.size(-1))
-        active_labels = labels.view(-1)
-        active_mask = active_labels != -100
-        active_logits = active_logits[active_mask]
-        active_labels = active_labels[active_mask]
-        loss = loss_fn(active_logits, active_labels)
-        
+        with torch.autocast(device_type="cuda"):
+            input_features_encoded = model.encoder(input_features)
+            decoder_output = model.decoder(input_ids, input_features_encoded)
+            logits = decoder_output.view(-1, decoder_output.size(-1))
+            active_logits = logits.view(-1, decoder_output.size(-1))
+            active_labels = labels.view(-1)
+            active_mask = active_labels != -100
+            active_logits = active_logits[active_mask]
+            active_labels = active_labels[active_mask]
+            loss = loss_fn(active_logits, active_labels)
+
         total_loss += loss.item()
         loss = loss / accumulation_steps
 
@@ -575,23 +595,25 @@ def train_and_evaluate(model, tokenizer, train_loader, eval_loader, optimizer, s
         if (global_step + 1) % accumulation_steps == 0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer=optimizer)
+            scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
 
             if clear_cache:
                 torch.cuda.empty_cache()
 
+        
         end_time = time.time()
         samples_per_sec = len(batch['input_features']) / (end_time - start_time)
 
         if global_step % log_interval == 0:
             writer.add_scalar(tag='Loss/train', scalar_value=total_loss / (global_step + 1), global_step=global_step)
-            
             lr = optimizer.param_groups[0].get('lr', None)
             writer.add_scalar(tag='LearningRate', scalar_value=lr, global_step=global_step)
             writer.add_scalar(tag='SamplesPerSec', scalar_value=samples_per_sec, global_step=global_step)
+            logging.info(f"Step {global_step} - Loss: {total_loss / (global_step + 1):.4f}, LR: {lr:.8f}")
 
+        
         if global_step % eval_interval == 0:
             model.eval()
             eval_start_time = time.time()
@@ -600,17 +622,16 @@ def train_and_evaluate(model, tokenizer, train_loader, eval_loader, optimizer, s
             all_labels = []
             batch_count = 0
             total_samples = 0
-            
-            with torch.no_grad():
-                for eval_batch in tqdm(eval_loader, desc=f"Evaluating (Step {global_step})", leave=False):
-                    input_features = eval_batch['input_features'].to(device)
-                    input_ids = eval_batch['input_ids'].to(device) #where is this coming from?  #input_ids = eval_batch['input_ids'].to(device)
 
+            with torch.no_grad():
+                for eval_batch in eval_loader:
+                    input_features = eval_batch['input_features'].to(device)
+                    input_ids = eval_batch['input_ids'].to(device)
                     labels = eval_batch['labels'].long().to(device)
-                   
+
                     batch_size = input_features.size(0)
                     total_samples += batch_size
-                    
+
                     input_features_encoded = model.encoder(input_features)
                     decoder_output = model.decoder(input_ids, input_features_encoded)
                     logits = decoder_output.view(-1, decoder_output.size(-1))
@@ -620,57 +641,45 @@ def train_and_evaluate(model, tokenizer, train_loader, eval_loader, optimizer, s
                     all_labels.extend(labels.cpu().numpy().tolist())
                     batch_count += 1
 
+  
             eval_time = time.time() - eval_start_time
-            eval_loss_avg = eval_loss / batch_count if batch_count > 0 else 0
+            loss_avg = eval_loss / batch_count if batch_count > 0 else 0
             predictions = {"predictions": np.array(all_predictions, dtype=object), "label_ids": np.array(all_labels, dtype=object)}
             metrics = compute_metrics(pred=predictions, tokenizer=tokenizer)
-            
-            writer.add_scalar('Loss/eval', eval_loss_avg, global_step)
+
+            writer.add_scalar('Loss/eval', loss_avg, global_step)
             writer.add_scalar('WER', metrics['wer'], global_step)
             writer.add_scalar('EvalSamples', total_samples, global_step)
             writer.add_scalar('EvalTimeSeconds', eval_time, global_step)
-            
-            lr = optimizer.param_groups[0].get('lr', 0)
-            
-            print("\n" + "="*80)
-            print(f"EVALUATION REPORT - STEP {global_step}")
-            print("="*80)
-            print("Metrics:")
-            print(f"  • Loss:               {eval_loss_avg:.4f}")
-            print(f"  • Word Error Rate:    {metrics['wer']:.2f}%")
-            print(f"  • Character Error Rate: {metrics.get('cer', 0):.2f}%")
-            print("Stats:")
-            print(f"  • Learning Rate:      {lr:.8f}")
-            print(f"  • Eval Batches:       {batch_count}")
-            print(f"  • Eval Samples:       {total_samples}")
-            print(f"  • Eval Time:          {eval_time:.2f}s ({total_samples/eval_time:.2f} samples/sec)")
-            print(f"  • Training Speed:     {samples_per_sec:.2f} samples/sec")
-            
-            if len(all_predictions) > 0:
-                print("\nSample Predictions:")
-                sample_indices = range(min(3, len(all_predictions)))
-                for idx in sample_indices:
-                    pred_str = tokenizer.decode(all_predictions[idx], skip_special_tokens=True)
-                    label_str = tokenizer.decode(all_labels[idx], skip_special_tokens=True)
-                    print(f"  Example {idx+1}:")
-                    print(f"    • Reference: {label_str}")
-                    print(f"    • Prediction: {pred_str}")
-            print("="*80 + "\n")
-            
-            logging.info(f"EVALUATION STEP {global_step} - WER: {metrics['wer']:.2f}%, Loss: {eval_loss_avg:.4f}, LR: {lr:.8f}")
-            scheduler.step()
+            lr = scheduler.get_last_lr()[0]
+
+            print(f" • WER:{metrics['wer']:.2f}% • Loss:{loss_avg:.4f} • LR:{lr:.8f}")
+            logging.info(f"EVALUATION STEP {global_step} - WER: {metrics['wer']:.2f}%, Loss: {loss_avg:.4f}, LR: {lr:.8f}")
+            #scheduler.step(metrics['wer'])
             model.train()
 
         if global_step % save_interval == 0:
             checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_step_{global_step}.pt')
             torch.save(model.state_dict(), checkpoint_path)
-            print(f"Model saved at step {global_step} to {checkpoint_path}")
             logging.info(f"Model saved at step {global_step} to {checkpoint_path}")
-
+            
         global_step += 1
         step_in_report += 1
+
+        lr = scheduler.get_last_lr()[0]
+        avg_loss = total_loss / (global_step + 1)
+        postfix_dict = {
+            'loss': f'{avg_loss:.4f}',
+            'lr': f'{lr:.6f}',
+            'WER': f'{metrics["wer"]:.4f}' if 'wer' in metrics else 'N/A',
+            'samp/sec': f'{samples_per_sec:.1f}'
+        }
+        progress_bar.set_postfix(postfix_dict, refresh=True)
         progress_bar.update(1)
+        scheduler.step()
+        profiler.step()
         
+    profiler.stop()
     final_model_path = os.path.join(checkpoint_dir, 'final_model.pt')
     torch.save(model.state_dict(), final_model_path)
     print(f"Training completed after {global_step} steps. Final model saved to {final_model_path}")
@@ -726,13 +735,8 @@ if __name__ == "__main__":
     model = Whisper(dims=dims).to(device='cuda')
     model.init_weights()
 
-    optimizer = torch.optim.Adafactor(params=model.parameters(), lr=0.025, 
-                         beta2_decay=-0.8, eps=(1e-10, 1e-4), 
-                         d=1.0, weight_decay=0.0, 
-                         foreach=None, maximize=False)
-
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer=optimizer, 
-                                                           last_epoch = -1, T_max=100000, eta_min=0)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=0.01, eps=1e-6, betas=(0.9, 0.98))
+    scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.5, total_iters=100000, last_epoch=-1)
     loss_fn = torch.nn.CrossEntropyLoss(ignore_index=-100)
 
     train_and_evaluate(model=model, 
