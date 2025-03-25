@@ -1,29 +1,38 @@
+# %%
 import os
+import warnings
 import time
 import logging
-from typing import Tuple, Optional, Dict, Union, Any, List
+import torch
+from torch import nn, Tensor
+import numpy as np
+from torch.nn import functional as F
+from typing import Tuple, Optional, Dict, Iterable
 import gzip
 import base64
 from datetime import datetime
-import numpy as np
+from contextlib import contextmanager
+import torchaudio
+import torchaudio.transforms as T
 from torch.utils.data import DataLoader
-from tqdm import tqdm
-import evaluate
-from datasets import load_dataset, Audio
-from transformers import WhisperFeatureExtractor, WhisperTokenizer
-from dataclasses import dataclass
 from torch.nn.functional import scaled_dot_product_attention
 from torch.utils.tensorboard.writer import SummaryWriter
-import torchaudio.transforms as T
-from torch.nn import functional as F
-import torch, torchaudio
-from torch import nn, Tensorimport torch, torchaudio
-from torch import nn, Tensor
-from contextlib import contextmanager
-from typing import Iterable
-from whisper.decoding import decode as decode_function
-from whisper.decoding import detect_language as detect_language_function
-from whisper.transcribe import transcribe as transcribe_function
+import evaluate
+from datasets import load_dataset
+from transformers import WhisperTokenizer
+import transformers
+from tqdm.notebook import tqdm
+from dataclasses import dataclass
+from audio import pad
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cuda.matmul.allow_tf32 = True
+transformers.utils.logging.set_verbosity_error()
+device = torch.device(device="cuda:0" if torch.cuda.is_available() else "cpu")
+dtype = torch.float32
+torch.set_default_dtype(dtype)
+warnings.filterwarnings("ignore")
+logging.basicConfig(level=logging.ERROR)
+
 
 try:
     from torch.nn.functional import scaled_dot_product_attention
@@ -32,6 +41,11 @@ try:
 except (ImportError, RuntimeError, OSError):
     scaled_dot_product_attention = None
     SDPA_AVAILABLE = False
+
+tokenizer = WhisperTokenizer.from_pretrained(
+    pretrained_model_name_or_path="openai/whisper-small")
+
+# %%
 
 
 @dataclass
@@ -79,6 +93,7 @@ def sinusoids(length, channels, max_timescale=10000):
     scaled_time = torch.arange(length)[:, np.newaxis] * inv_timescales[np.newaxis, :]
     return torch.cat([torch.sin(scaled_time), torch.cos(scaled_time)], dim=1)
 
+
 @contextmanager
 def disable_sdpa():
     prev_state = MultiHeadAttention.use_sdpa
@@ -87,6 +102,8 @@ def disable_sdpa():
         yield
     finally:
         MultiHeadAttention.use_sdpa = prev_state
+
+
 class MultiHeadAttention(nn.Module):
     use_sdpa = True
 
@@ -193,7 +210,8 @@ class AudioEncoder(nn.Module):
 
     def forward(self, x: Tensor):
         """
-        x : torch.Tensor, shape = (batch_size, n_mels, n_ctx), the mel spectrogram of the audio
+        x : torch.Tensor, shape = (batch_size, n_mels, n_ctx)
+            the mel spectrogram of the audio
         """
         x = F.gelu(self.conv1(x))
         x = F.gelu(self.conv2(x))
@@ -207,6 +225,7 @@ class AudioEncoder(nn.Module):
 
         x = self.ln_post(x)
         return x
+
 
 class TextDecoder(nn.Module):
     def __init__(
@@ -229,7 +248,12 @@ class TextDecoder(nn.Module):
         self.register_buffer("mask", mask, persistent=False)
 
     def forward(self, x: Tensor, xa: Tensor, kv_cache: Optional[dict] = None):
-        """        x : torch.LongTensor, shape = (batch_size, <= n_ctx), xa : torch.Tensor, shape = (batch_size, n_audio_ctx, n_audio_state)"""
+        """
+        x : torch.LongTensor, shape = (batch_size, <= n_ctx)
+            the text tokens
+        xa : torch.Tensor, shape = (batch_size, n_audio_ctx, n_audio_state)
+            the encoded audio features to be attended on
+        """
         offset = next(iter(kv_cache.values())).shape[1] if kv_cache else 0
         x = (
             self.token_embedding(x)
@@ -266,44 +290,11 @@ class Whisper(nn.Module):
             self.dims.n_text_head,
             self.dims.n_text_layer,
         )
-
         all_heads = torch.zeros(
             self.dims.n_text_layer, self.dims.n_text_head, dtype=torch.bool
         )
         all_heads[self.dims.n_text_layer // 2 :] = True
         self.register_buffer("alignment_heads", all_heads.to_sparse(), persistent=False)
-
-    def _init_weights(self, module):
-        std = 0.02
-        self.init_counts = {"Linear": 0, "Conv1d": 0, "LayerNorm": 0, "Embedding": 0}
-
-        for name, module in self.named_modules():
-            if isinstance(module, Linear):
-                nn.init.normal_(module.weight, mean=0.0, std=std)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-                self.init_counts["Linear"] += 1
-            if isinstance(module, Conv1d):
-                nn.init.normal_(module.weight, mean=0.0, std=std)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-                self.init_counts["Conv1d"] += 1
-            if isinstance(module, LayerNorm):
-                nn.init.ones_(module.weight)
-                nn.init.zeros_(module.bias)
-                self.init_counts["LayerNorm"] += 1
-            if isinstance(module, nn.Embedding):
-                nn.init.normal_(module.weight, mean=0.0, std=std)
-                if module.padding_idx is not None:
-                    module.weight.data[module.padding_idx].zero_()
-                self.init_counts["Embedding"] += 1
-            
-    def init_weights(self):  # noqa: F811
-        print("Initializing all weights")
-        self.apply(self._init_weights)
-        print("Initialization summary:")
-        for module_type, count in self.init_counts.items():
-            print(f"{module_type}: {count}")
 
     def set_alignment_heads(self, dump: bytes):
         array = np.frombuffer(
@@ -314,23 +305,24 @@ class Whisper(nn.Module):
         )
         self.register_buffer("alignment_heads", mask.to_sparse(), persistent=False)
 
-    def embed_audio(self, input_features: torch.Tensor):
-        return self.encoder(input_features)
+    def embed_audio(self, mel: torch.Tensor):
+        return self.encoder(mel)
 
-    def logits(self,input_ids: torch.Tensor, audio_features: torch.Tensor):
-        return self.decoder(input_ids, audio_features)
+    def logits(self, tokens: torch.Tensor, audio_features: torch.Tensor):
+        return self.decoder(tokens, audio_features)
 
-
-    def forward(self, mel: torch.Tensor, tokens: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(
+        self, mel: torch.Tensor, tokens: torch.Tensor
+    ) -> Dict[str, torch.Tensor]:
         return self.decoder(tokens, self.encoder(mel))
-    
+
     @property
     def device(self):
         return next(self.parameters()).device
 
     @property
     def is_multilingual(self):
-        return self.dims.n_vocab >= 51865
+        return self.dims.n_vocab >= len(tokenizer)
 
     @property
     def num_languages(self):
@@ -343,7 +335,6 @@ class Whisper(nn.Module):
 
         def save_to_cache(module, _, output):
             if module not in cache or output.shape[1] > self.dims.n_text_ctx:
-                # save as-is, for the first token or cross attention
                 cache[module] = output
             else:
                 cache[module] = torch.cat([cache[module], output], dim=1).detach()
@@ -357,9 +348,8 @@ class Whisper(nn.Module):
         self.decoder.apply(install_hooks)
         return cache, hooks
 
-    detect_language = detect_language_function
-    transcribe = transcribe_function
-    decode = decode_function
+
+# %%
 
 def ctx_to_samples(audio_ctx, hop_length):
     samples_token = hop_length * 2
@@ -374,15 +364,28 @@ def load_wave(wave_data, sample_rate):
         sr = wave_data["sampling_rate"]
     else:
         raise TypeError("Invalid wave_data format.")
+    
+    if waveform.dim() == 1:
+        waveform = waveform.unsqueeze(0)
+    
     if sr != sample_rate:
-        waveform = torchaudio.transforms.Resample(orig_freq=sr, new_freq=sample_rate)(
-            waveform
-        )
+        original_length = waveform.shape[1]
+        target_length = int(original_length * (sample_rate / sr))
+        
+        resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=sample_rate)
+        waveform = resampler(waveform)
+        
+        if abs(waveform.shape[1] - target_length) > 1:
+            new_waveform = torch.zeros((waveform.shape[0], target_length), dtype=waveform.dtype, device=waveform.device)
+            copy_length = min(waveform.shape[1], target_length)
+            new_waveform[:, :copy_length] = waveform[:, :copy_length]
+            waveform = new_waveform
+    
     return waveform.flatten()
 
 def pad(array, target_length, axis=-1, dtype: torch.dtype = torch.float32):
     if isinstance(array, np.ndarray):
-        array = torch.from_numpy(ndarray=array).to(dtype=dtype)
+        array = torch.from_numpy(array).to(dtype)
     if torch.is_tensor(array):
         if array.shape[axis] > target_length:
             array = array.index_select(
@@ -404,36 +407,49 @@ def pad(array, target_length, axis=-1, dtype: torch.dtype = torch.float32):
         )
     return array
 
-def process_audio(audio, audio_ctx, n_mels, hop_length, n_fft, sr):
+def exact_div(x, y):
+    assert x % y == 0
+    return x // y
+
+def process_audio(audio, audio_ctx, mels, hop_length, n_fft, sr):
+
     audio = load_wave(wave_data=audio, sample_rate=sr)
-    target_length = ctx_to_samples(audio_ctx=audio_ctx, hop_length=hop_length)
-    audio = pad(array=audio, target_length=target_length)
+    n_samples = ctx_to_samples(audio_ctx=audio_ctx, hop_length=hop_length)
+    audio = pad(array=audio, target_length=n_samples)
+
     transform = T.MelSpectrogram(
         sample_rate=sr,
         n_fft=n_fft,
         hop_length=hop_length,
-        n_mels=n_mels,
-        normalized=False,
-        center=True,
+        n_mels=mels,
+        norm='slaney',
+        normalized=True,
+        power=2.0,
+        center=True, 
+        window_fn=torch.hann_window,
     )
+    
     mel_spectrogram = transform(audio)
-    mel_spectrogram = mel_spectrogram[:, :3000]
-    epsilon = 1e-10
-    log_mel = torch.log(mel_spectrogram + epsilon)
-    log_mel = (log_mel - log_mel.mean(dim=-1, keepdim=True)) / (log_mel.std(dim=-1, keepdim=True) + 1e-10)
+
+    target_frames = exact_div(n_samples, hop_length) 
+    mel_spectrogram = pad(array=mel_spectrogram, target_length=target_frames, axis=-1)
+
+    log_mel = torch.clamp(mel_spectrogram, min=1e-10).log10()
+    log_mel = torch.maximum(log_mel, log_mel.max() - 8.0)
+    log_mel = (log_mel + 4.0) / 4.0
+    
     return log_mel
 
 tokenizer = WhisperTokenizer.from_pretrained(
-    pretrained_model_name_or_path="openai/whisper-small"
-)
+    pretrained_model_name_or_path="openai/whisper-small")
 
 class DataCollator:
-    def __init__(self, tokenizer, audio_ctx=1500, text_ctx=448, n_mels=128, n_fft=400, hop_length=160, sample_rate=16000, device="cpu"):
+    def __init__(self, tokenizer, audio_ctx, text_ctx, mels, n_fft, hop_length, sample_rate=16000, device="cpu"):
         self.tokenizer = tokenizer
         self.text_ctx = text_ctx
         self.audio_ctx = audio_ctx
         self.sample_rate = sample_rate
-        self.n_mels = n_mels
+        self.mels = mels
         self.n_fft = n_fft
         self.hop_length = hop_length
         self.device = device
@@ -448,7 +464,7 @@ class DataCollator:
             // self.hop_length
         )
         batch_audio = torch.zeros(
-            size=(batch, self.n_mels, max_time_frames),
+            size=(batch, self.mels, max_time_frames),
             dtype=torch.float32,
             device=self.device,
         )
@@ -470,26 +486,23 @@ class DataCollator:
             audio = process_audio(
                 audio=feature["audio"],
                 audio_ctx=self.audio_ctx,
-                n_mels=self.n_mels,
+                mels=self.mels,
                 hop_length=self.hop_length,
                 n_fft=self.n_fft,
                 sr=self.sample_rate,
             )
-
             time_frames = audio.shape[-1]
 
             transcript = feature["transcription"]
             encoded_input = self.tokenizer.encode(transcript)
             encoded_label = self.tokenizer.encode(transcript)
-
+            
             decoder_input = [self.decoder_start_token_id] + encoded_input
             labels = encoded_label + [self.tokenizer.eos_token_id]
-
             decoder_input = decoder_input[: self.text_ctx] + [self.pad_token_id] * (
                 self.text_ctx - len(decoder_input)
             )
             labels = labels[: self.text_ctx] + [-100] * (self.text_ctx - len(labels))
-
             batch_input_ids[i, : len(decoder_input)] = torch.tensor(data=decoder_input, dtype=torch.long)
             batch_labels[i, : len(labels)] = torch.tensor(data=labels, dtype=torch.long)
             batch_audio[i, :, :time_frames] = torch.tensor(data=audio, dtype=torch.float32)
@@ -497,11 +510,9 @@ class DataCollator:
         return {
             "input_features": batch_audio,
             "input_ids": batch_input_ids,
-            "labels": batch_labels,
-        }
+            "labels": batch_labels}
 
 metric = evaluate.load(path="wer")
-
 def compute_metrics(pred, tokenizer):
     pred_ids = pred["predictions"]
     label_ids = pred["label_ids"]
@@ -514,14 +525,56 @@ def compute_metrics(pred, tokenizer):
     label_ids[label_ids == -100] = tokenizer.pad_token_id
     pred_str = tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
     label_str = tokenizer.batch_decode(label_ids, skip_special_tokens=True)
-    wer = 100 * metric.compute(predictions=pred_str, references=label_str) # type: ignore
+    wer = 100 * metric.compute(predictions=pred_str, references=label_str)
     return {"wer": wer}
 
+def generate_predictions(model, input_features_encoded, tokenizer, device, batch_size, min_length):
+    decoder_start_token_id = tokenizer.bos_token_id
+    eos_token_id = tokenizer.eos_token_id
+    pad_token_id = tokenizer.pad_token_id
+    
+    generated_ids = torch.full(
+        size=(batch_size, 1), 
+        fill_value=decoder_start_token_id, 
+        dtype=torch.long, 
+        device=device
+    )
+    
+    max_length = 448
+    all_sequences_finished = False
+    
+    finished_sequences = torch.zeros(batch_size, dtype=torch.bool, device=device)
+    
+    for i in range(max_length - 1):
+        attention_mask = torch.ones_like(generated_ids)
+        
+        with torch.no_grad():
+            outputs = model(
+                input_features=input_features_encoded,
+                decoder_input_ids=generated_ids,
+                decoder_attention_mask=attention_mask)
+            
+        next_token_logits = outputs.logits[:, -1, :]
+        
+        if i < min_length:
+            next_token_logits[:, eos_token_id] = float('-inf')
+        next_tokens = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+        generated_ids = torch.cat([generated_ids, next_tokens], dim=1)
+        finished_sequences = finished_sequences | (next_tokens.squeeze(-1) == eos_token_id)
+        if finished_sequences.all() and i >= min_length:
+            break
+    
+    if generated_ids.size(1) < max_length:
+        generated_ids = torch.nn.functional.pad(
+            input=generated_ids, 
+            pad=(0, max_length - generated_ids.size(1)), 
+            value=pad_token_id)
+    
+    return generated_ids
 
-def train_and_evaluate(model, tokenizer, train_loader, eval_loader, optimizer, scheduler, loss_fn,
-                        max_steps=10000, device='cuda', accumulation_steps=1, clear_cache=True,
-                        log_interval=10, eval_interval=100, save_interval=1000,
-                        checkpoint_dir="checkpoint_dir", log_dir="log_dir"):
+def train_and_evaluate(model, tokenizer, train_loader, eval_loader, optimizer, scheduler, loss_fn, max_steps=10000, device='cuda', 
+    accumulation_steps=1, clear_cache=True, log_interval=10, eval_interval=100, save_interval=1000, checkpoint_dir="checkpoint_dir", log_dir="log_dir"):
+    
     model.to(device)
     global_step = 0
     scaler = torch.GradScaler()
@@ -537,21 +590,10 @@ def train_and_evaluate(model, tokenizer, train_loader, eval_loader, optimizer, s
     optimizer.zero_grad()
 
     profiler = torch.profiler.profile(
-        activities=[
-            torch.profiler.ProfilerActivity.CPU,
-            torch.profiler.ProfilerActivity.CUDA,
-        ],
-        schedule=torch.profiler.schedule(
-            wait=1,
-            warmup=1,
-            active=1,
-            repeat=1
-        ),
+        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+        schedule=torch.profiler.schedule(wait=1, warmup=1, active=1, repeat=1),
         on_trace_ready=torch.profiler.tensorboard_trace_handler(log_dir),
-        record_shapes=True,
-        profile_memory=True,
-        with_stack=True
-    )
+        record_shapes=True, profile_memory=True, with_stack=True)
 
     profiler.start()
 
@@ -602,17 +644,15 @@ def train_and_evaluate(model, tokenizer, train_loader, eval_loader, optimizer, s
             if clear_cache:
                 torch.cuda.empty_cache()
 
-        
         end_time = time.time()
         samples_per_sec = len(batch['input_features']) / (end_time - start_time)
 
         if global_step % log_interval == 0:
+            lr = scheduler.get_last_lr()[0]
             writer.add_scalar(tag='Loss/train', scalar_value=total_loss / (global_step + 1), global_step=global_step)
-            lr = optimizer.param_groups[0].get('lr', None)
             writer.add_scalar(tag='LearningRate', scalar_value=lr, global_step=global_step)
             writer.add_scalar(tag='SamplesPerSec', scalar_value=samples_per_sec, global_step=global_step)
             logging.info(f"Step {global_step} - Loss: {total_loss / (global_step + 1):.4f}, LR: {lr:.8f}")
-
         
         if global_step % eval_interval == 0:
             model.eval()
@@ -637,11 +677,12 @@ def train_and_evaluate(model, tokenizer, train_loader, eval_loader, optimizer, s
                     logits = decoder_output.view(-1, decoder_output.size(-1))
                     loss = loss_fn(logits, labels.view(-1))
                     eval_loss += loss.item()
+
                     all_predictions.extend(torch.argmax(decoder_output, dim=-1).cpu().numpy().tolist())
                     all_labels.extend(labels.cpu().numpy().tolist())
                     batch_count += 1
 
-  
+            lr = scheduler.get_last_lr()[0]
             eval_time = time.time() - eval_start_time
             loss_avg = eval_loss / batch_count if batch_count > 0 else 0
             predictions = {"predictions": np.array(all_predictions, dtype=object), "label_ids": np.array(all_labels, dtype=object)}
@@ -651,11 +692,15 @@ def train_and_evaluate(model, tokenizer, train_loader, eval_loader, optimizer, s
             writer.add_scalar('WER', metrics['wer'], global_step)
             writer.add_scalar('EvalSamples', total_samples, global_step)
             writer.add_scalar('EvalTimeSeconds', eval_time, global_step)
-            lr = scheduler.get_last_lr()[0]
 
-            print(f" • WER:{metrics['wer']:.2f}% • Loss:{loss_avg:.4f} • LR:{lr:.8f}")
+            pred = tokenizer.decode(all_predictions[0], skip_special_tokens=True)
+            label = tokenizer.decode(all_labels[0], skip_special_tokens=True)
+            
+            print(f"STEP {global_step} • WER:{metrics['wer']:.2f}% • Loss:{loss_avg:.4f} • LR:{lr:.8f}")
+            print(f"PRED: '{pred}'")
+            print(f"REF : '{label}'")
+            print()
             logging.info(f"EVALUATION STEP {global_step} - WER: {metrics['wer']:.2f}%, Loss: {loss_avg:.4f}, LR: {lr:.8f}")
-            #scheduler.step(metrics['wer'])
             model.train()
 
         if global_step % save_interval == 0:
@@ -666,14 +711,9 @@ def train_and_evaluate(model, tokenizer, train_loader, eval_loader, optimizer, s
         global_step += 1
         step_in_report += 1
 
-        lr = scheduler.get_last_lr()[0]
         avg_loss = total_loss / (global_step + 1)
-        postfix_dict = {
-            'loss': f'{avg_loss:.4f}',
-            'lr': f'{lr:.6f}',
-            'WER': f'{metrics["wer"]:.4f}' if 'wer' in metrics else 'N/A',
-            'samp/sec': f'{samples_per_sec:.1f}'
-        }
+        postfix_dict = {'loss': f'{avg_loss:.4f}', 'lr': f'{lr:.6f}', 'WER': f'{metrics["wer"]:.4f}' if 'wer' in metrics else 'N/A',
+            'samp/sec': f'{samples_per_sec:.1f}'}
         progress_bar.set_postfix(postfix_dict, refresh=True)
         progress_bar.update(1)
         scheduler.step()
@@ -686,6 +726,13 @@ def train_and_evaluate(model, tokenizer, train_loader, eval_loader, optimizer, s
     writer.close()
     progress_bar.close()
 
+checkpoint_dir = './output/checkpoints'
+os.makedirs(checkpoint_dir, exist_ok=True)
+log_dir = os.path.join("./output/logs", datetime.now().strftime(format="%m-%d_%H"))
+os.makedirs(name=log_dir, exist_ok=True)
+
+# %%
+
 if __name__ == "__main__":
 
     checkpoint_dir = './output/checkpoints'
@@ -696,7 +743,7 @@ if __name__ == "__main__":
     logging.basicConfig(
         filename=os.path.join(log_dir, 'training.log'), filemode='w', format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-    token = ""
+    token = "" #hugging face token
     dataset = load_dataset(
         path="google/fleurs",
         name="en_us",
@@ -705,8 +752,32 @@ if __name__ == "__main__":
         trust_remote_code=True,
         cache_dir="E:/cache",
     ).select_columns(column_names=["audio", "transcription"])
+   
+    debug = None
+    
+    dims = ModelDimensions(
+        n_mels=80,
+        n_audio_ctx=1500,
+        n_audio_state=512,
+        n_audio_head=4,
+        n_audio_layer=4,
+        n_vocab=len(tokenizer),
+        n_text_ctx=448,
+        n_text_state=512,
+        n_text_head=4,
+        n_text_layer=4,
+    )
+    
+    model = Whisper(dims).to('cuda')
 
-    DataCollator = DataCollator(tokenizer=tokenizer)
+    DataCollator = DataCollator(tokenizer=tokenizer, 
+                                audio_ctx=dims.n_audio_ctx, 
+                                text_ctx=dims.n_text_ctx, 
+                                mels=dims.n_mels,
+                                n_fft=400,
+                                hop_length=160,
+                                sample_rate=16000, 
+                                device='cuda')
 
     train_dataloader = DataLoader(
         dataset=dataset["train"], 
@@ -715,30 +786,16 @@ if __name__ == "__main__":
         num_workers=0)
 
     eval_dataloader = DataLoader(
-        dataset=dataset["test"].take(100),
+        dataset=dataset["test"],
         batch_size=1,
         collate_fn=DataCollator,
         num_workers=0)
     
-    dims =ModelDimensions(
-        n_mels=128,
-        n_audio_ctx=1500,
-        n_audio_head=2,
-        n_audio_layer=2,
-        n_audio_state=512,
-        n_vocab=51865,
-        n_text_state=512,
-        n_text_ctx=448,
-        n_text_head=2,
-        n_text_layer=2,
-    )
-    model = Whisper(dims=dims).to(device='cuda')
-    model.init_weights()
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=0.01, eps=1e-6, betas=(0.9, 0.98))
-    scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.5, total_iters=100000, last_epoch=-1)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=0.01, eps=1e-8, betas=(0.9, 0.98))
+    scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.25, total_iters=10000, last_epoch=-1)
     loss_fn = torch.nn.CrossEntropyLoss(ignore_index=-100)
-
+        
     train_and_evaluate(model=model, 
         tokenizer=tokenizer, 
         train_loader=train_dataloader, 
@@ -746,14 +803,24 @@ if __name__ == "__main__":
         optimizer=optimizer, 
         scheduler=scheduler, 
         loss_fn=loss_fn, 
-        max_steps=100000,
+        max_steps=10000,
         device='cuda', 
         accumulation_steps=1, 
-        clear_cache=True, 
+        clear_cache=False, 
         log_interval=10, 
-        eval_interval=100, 
-        save_interval=25000, 
+        eval_interval=500, 
+        save_interval=10000, 
         checkpoint_dir=checkpoint_dir, 
         log_dir=log_dir
         )
+    
+
+# %%
+from tensorboard import program
+log_dir = "./output/logs" 
+tb = program.TensorBoard()
+tb.configure(argv=[None, '--logdir', log_dir])
+url = tb.launch()
+print(f"TensorBoard started at {url}")
+
 
