@@ -444,7 +444,7 @@ tokenizer = WhisperTokenizer.from_pretrained(
     pretrained_model_name_or_path="openai/whisper-small")
 
 class DataCollator:
-    def __init__(self, tokenizer, audio_ctx, text_ctx, mels, n_fft, hop_length, sample_rate=16000, device="cpu"):
+    def __init__(self, tokenizer, audio_ctx, text_ctx, mels, n_fft=1024, hop_length=160, sample_rate=16000, device="cpu"):
         self.tokenizer = tokenizer
         self.text_ctx = text_ctx
         self.audio_ctx = audio_ctx
@@ -455,35 +455,16 @@ class DataCollator:
         self.device = device
         self.decoder_start_token_id = 50258
         self.pad_token_id = 50257
+        self.eos_token_id = 50257
 
     def __call__(self, features):
         batch = len(features)
-        
-        max_time_frames = (
-            ctx_to_samples(audio_ctx=self.audio_ctx, hop_length=self.hop_length)
-            // self.hop_length
-        )
-        batch_audio = torch.zeros(
-            size=(batch, self.mels, max_time_frames),
-            dtype=torch.float32,
-            device=self.device,
-        )
-        
-        batch_input_ids = torch.full(
-            size=(batch, self.text_ctx),
-            fill_value=self.pad_token_id,
-            dtype=torch.long,
-            device=self.device,
-        )
-        batch_labels = torch.full(
-            size=(batch, self.text_ctx),
-            fill_value=-100,
-            dtype=torch.long,
-            device=self.device,
-        )
 
-
-        for i, feature in enumerate(features):
+        max_time_frames = 0
+        max_text_length = 0
+        
+        processed_features = []
+        for feature in features:
             audio = process_audio(
                 audio=feature["audio"],
                 audio_ctx=self.audio_ctx,
@@ -493,52 +474,58 @@ class DataCollator:
                 sr=self.sample_rate,
             )
             time_frames = audio.shape[-1]
-            batch_audio[i, :, :time_frames] = torch.tensor(data=audio, dtype=torch.float32)
+            max_time_frames = max(max_time_frames, time_frames)
             
-            transcript = feature["transcription"] 
-            max_content_length = self.text_ctx - 2
+            transcript = feature["transcription"]
+            encoded_input = self.tokenizer.encode(transcript, add_special_tokens=False)
+            encoded_label = self.tokenizer.encode(transcript, add_special_tokens=False)
+            
+            decoder_input = [self.decoder_start_token_id] + encoded_input
+            labels = encoded_label + [self.eos_token_id]
+            
+            max_text_length = max(max_text_length, len(decoder_input), len(labels))
+            
+            processed_features.append({
+                "audio": audio,
+                "decoder_input": decoder_input,
+                "labels": labels
+            })
+        
+        max_text_length = min(max_text_length, self.text_ctx)
+        
+        batch_audio = torch.zeros(
+            size=(batch, self.mels, max_time_frames),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        batch_input_ids = torch.full(
+            size=(batch, max_text_length),
+            fill_value=self.pad_token_id,
+            dtype=torch.long,
+            device=self.device,
+        )
+        batch_labels = torch.full(
+            size=(batch, max_text_length),
+            fill_value=-100,
+            dtype=torch.long,
+            device=self.device,
+        )
 
-            if len(transcript) > max_content_length:
-                transcript = transcript[:max_content_length]
-
-            encoded_text = self.tokenizer.encode(
-                transcript,
-                truncation=True,
-                max_length=max_content_length,
-                add_special_tokens=False
-            )
-
-            decoder_input = [self.decoder_start_token_id] + encoded_text
-            labels = encoded_text + [self.tokenizer.eos_token_id]
-
-            padded_decoder_input = self.tokenizer.pad(
-                {"input_ids": [decoder_input]},
-                padding="max_length",
-                max_length=self.text_ctx,
-                return_tensors="pt"
-            )
-
-            padded_labels = self.tokenizer.pad(
-                {"input_ids": [labels]},
-                padding="max_length", 
-                max_length=self.text_ctx,
-                return_tensors="pt"
-            )
-
-            padded_labels["input_ids"] = padded_labels["input_ids"].masked_fill(
-                padded_labels["attention_mask"].ne(1), 
-                -100
-            )
-
-            batch_input_ids[i] = padded_decoder_input["input_ids"][0]
-            batch_labels[i] = padded_labels["input_ids"][0]
-            batch_audio[i, :, :time_frames] = torch.tensor(audio, dtype=torch.float32)
+        for i, feature in enumerate(processed_features):
+            audio = feature["audio"]
+            time_frames = audio.shape[-1]
+            decoder_input = feature["decoder_input"][:max_text_length]
+            labels = feature["labels"][:max_text_length]
+            
+            batch_audio[i, :, :time_frames] = torch.tensor(data=audio, dtype=torch.float32)
+            batch_input_ids[i, :len(decoder_input)] = torch.tensor(data=decoder_input, dtype=torch.long)
+            batch_labels[i, :len(labels)] = torch.tensor(data=labels, dtype=torch.long)
 
         return {
             "input_features": batch_audio,
             "input_ids": batch_input_ids,
             "labels": batch_labels,
-            }
+        }
 
 metric = evaluate.load(path="wer")
 def compute_metrics(pred, tokenizer):
