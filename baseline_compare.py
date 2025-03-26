@@ -24,23 +24,9 @@ import transformers
 from tqdm.notebook import tqdm
 from dataclasses import dataclass
 from audio import pad
-torch.backends.cudnn.allow_tf32 = True
-torch.backends.cuda.matmul.allow_tf32 = True
-transformers.utils.logging.set_verbosity_error()
+
 device = torch.device(device="cuda:0" if torch.cuda.is_available() else "cpu")
 dtype = torch.float32
-torch.set_default_dtype(dtype)
-warnings.filterwarnings("ignore")
-logging.basicConfig(level=logging.ERROR)
-
-
-try:
-    from torch.nn.functional import scaled_dot_product_attention
-
-    SDPA_AVAILABLE = True
-except (ImportError, RuntimeError, OSError):
-    scaled_dot_product_attention = None
-    SDPA_AVAILABLE = False
 
 tokenizer = WhisperTokenizer.from_pretrained(
     pretrained_model_name_or_path="openai/whisper-small")
