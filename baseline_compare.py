@@ -46,11 +46,9 @@ tokenizer = WhisperTokenizer.from_pretrained(
     pretrained_model_name_or_path="openai/whisper-small")
 
 # %%
-
-
 @dataclass
 class ModelDimensions:
-    n_mels: int
+    mels: int
     n_audio_ctx: int
     n_audio_state: int
     n_audio_head: int
@@ -60,7 +58,9 @@ class ModelDimensions:
     n_text_state: int
     n_text_head: int
     n_text_layer: int
-
+    pad_token_id: int
+    eos_token_id: int
+    decoder_start_token_id: int
 
 class LayerNorm(nn.LayerNorm):
     def forward(self, x: Tensor) -> Tensor:
@@ -75,7 +75,6 @@ class Linear(nn.Linear):
             None if self.bias is None else self.bias.to(x.dtype),
         )
 
-
 class Conv1d(nn.Conv1d):
     def _conv_forward(
         self, x: Tensor, weight: Tensor, bias: Optional[Tensor]
@@ -83,7 +82,6 @@ class Conv1d(nn.Conv1d):
         return super()._conv_forward(
             x, weight.to(x.dtype), None if bias is None else bias.to(x.dtype)
         )
-
 
 def sinusoids(length, channels, max_timescale=10000):
     """Returns sinusoids for positional embedding"""
@@ -93,7 +91,6 @@ def sinusoids(length, channels, max_timescale=10000):
     scaled_time = torch.arange(length)[:, np.newaxis] * inv_timescales[np.newaxis, :]
     return torch.cat([torch.sin(scaled_time), torch.cos(scaled_time)], dim=1)
 
-
 @contextmanager
 def disable_sdpa():
     prev_state = MultiHeadAttention.use_sdpa
@@ -102,7 +99,6 @@ def disable_sdpa():
         yield
     finally:
         MultiHeadAttention.use_sdpa = prev_state
-
 
 class MultiHeadAttention(nn.Module):
     use_sdpa = True
@@ -161,9 +157,8 @@ class MultiHeadAttention(nn.Module):
 
         return out, qk
 
-
 class ResidualAttentionBlock(nn.Module):
-    def __init__(self, n_state: int, n_head: int, cross_attention: bool = False):
+    def __init__(self, n_state: int, n_head: int, cross_attention: bool = True):
         super().__init__()
 
         self.attn = MultiHeadAttention(n_state, n_head)
@@ -193,13 +188,12 @@ class ResidualAttentionBlock(nn.Module):
         x = x + self.mlp(self.mlp_ln(x))
         return x
 
-
 class AudioEncoder(nn.Module):
     def __init__(
-        self, n_mels: int, n_ctx: int, n_state: int, n_head: int, n_layer: int
+        self, mels: int, n_ctx: int, n_state: int, n_head: int, n_layer: int
     ):
         super().__init__()
-        self.conv1 = Conv1d(n_mels, n_state, kernel_size=3, padding=1)
+        self.conv1 = Conv1d(mels, n_state, kernel_size=3, padding=1)
         self.conv2 = Conv1d(n_state, n_state, kernel_size=3, stride=2, padding=1)
         self.register_buffer("positional_embedding", sinusoids(n_ctx, n_state))
 
@@ -210,7 +204,7 @@ class AudioEncoder(nn.Module):
 
     def forward(self, x: Tensor):
         """
-        x : torch.Tensor, shape = (batch_size, n_mels, n_ctx)
+        x : torch.Tensor, shape = (batch_size, mels, n_ctx)
             the mel spectrogram of the audio
         """
         x = F.gelu(self.conv1(x))
@@ -225,7 +219,6 @@ class AudioEncoder(nn.Module):
 
         x = self.ln_post(x)
         return x
-
 
 class TextDecoder(nn.Module):
     def __init__(
@@ -271,13 +264,19 @@ class TextDecoder(nn.Module):
 
         return logits
 
+def shift_tokens_right(input_ids: torch.Tensor, pad_token_id: int, decoder_start_token_id: int):
+    shifted_input_ids = input_ids.new_zeros(input_ids.shape)
+    shifted_input_ids[:, 1:] = input_ids[:, :-1].clone()
+    shifted_input_ids[:, 0] = decoder_start_token_id
+    shifted_input_ids.masked_fill_(shifted_input_ids == -100, pad_token_id)
+    return shifted_input_ids
 
-class Whisper(nn.Module):
+class model(nn.Module):
     def __init__(self, dims: ModelDimensions):
         super().__init__()
         self.dims = dims
         self.encoder = AudioEncoder(
-            self.dims.n_mels,
+            self.dims.mels,
             self.dims.n_audio_ctx,
             self.dims.n_audio_state,
             self.dims.n_audio_head,
@@ -311,10 +310,24 @@ class Whisper(nn.Module):
     def logits(self, tokens: torch.Tensor, audio_features: torch.Tensor):
         return self.decoder(tokens, audio_features)
 
-    def forward(
-        self, mel: torch.Tensor, tokens: torch.Tensor
-    ) -> Dict[str, torch.Tensor]:
-        return self.decoder(tokens, self.encoder(mel))
+    def forward(self, input_features: torch.Tensor, input_ids=None, labels=None, decoder_inputs_embeds=None) -> Dict[str, torch.Tensor]:
+
+        if input_ids is None and decoder_inputs_embeds is None:
+            if labels is not None:
+                input_ids = shift_tokens_right(
+                    labels, self.dims.pad_token_id, self.dims.decoder_start_token_id)
+            else:
+                raise ValueError("You have to provide either decoder_input_ids or labels")
+        
+        encoded_audio = self.encoder(input_features)
+        logits = self.decoder(input_ids, encoded_audio)
+        
+        loss = None
+        if labels is not None:
+            loss = F.cross_entropy(
+                logits.view(-1, logits.shape[-1]), labels.view(-1), ignore_index=-100)
+        
+        return {"logits": logits, "loss": loss, "labels": labels, "input_ids": input_ids}
 
     @property
     def device(self):
@@ -347,6 +360,38 @@ class Whisper(nn.Module):
 
         self.decoder.apply(install_hooks)
         return cache, hooks
+
+    def _init_weights(self, module):
+        std = 0.02
+        self.init_counts = {"Linear": 0, "Conv1d": 0, "LayerNorm": 0, "Embedding": 0}
+
+        for name, module in self.named_modules():
+            if isinstance(module, Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=std)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+                self.init_counts["Linear"] += 1
+            if isinstance(module, Conv1d):
+                nn.init.normal_(module.weight, mean=0.0, std=std)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+                self.init_counts["Conv1d"] += 1
+            if isinstance(module, LayerNorm):
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
+                self.init_counts["LayerNorm"] += 1
+            if isinstance(module, nn.Embedding):
+                nn.init.normal_(module.weight, mean=0.0, std=std)
+                if module.padding_idx is not None:
+                    module.weight.data[module.padding_idx].zero_()
+                self.init_counts["Embedding"] += 1
+
+    def init_weights(self):
+        print("Initializing all weights")
+        self.apply(self._init_weights)
+        print("Initialization summary:")
+        for module_type, count in self.init_counts.items():
+            print(f"{module_type}: {count}")
 
 
 # %%
@@ -430,7 +475,6 @@ def process_audio(audio, audio_ctx, mels, hop_length, n_fft, sr):
     )
     
     mel_spectrogram = transform(audio)
-
     target_frames = exact_div(n_samples, hop_length) 
     mel_spectrogram = pad(array=mel_spectrogram, target_length=target_frames, axis=-1)
 
@@ -441,7 +485,8 @@ def process_audio(audio, audio_ctx, mels, hop_length, n_fft, sr):
     return log_mel
 
 tokenizer = WhisperTokenizer.from_pretrained(
-    pretrained_model_name_or_path="openai/whisper-small")
+    pretrained_model_name_or_path="openai/whisper-small"
+)
 
 class DataCollator:
     def __init__(self, tokenizer, audio_ctx, text_ctx, mels, n_fft=1024, hop_length=160, sample_rate=16000, device="cpu"):
@@ -541,7 +586,7 @@ def compute_metrics(pred, tokenizer):
     pred_str = tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
     label_str = tokenizer.batch_decode(label_ids, skip_special_tokens=True)
     wer = 100 * metric.compute(predictions=pred_str, references=label_str)
-    return {"wer": wer}
+    return {"wer": wer, "pred_str": pred_str, "label_str": label_str}
 
 def generate_predictions(model, input_features_encoded, tokenizer, device, batch_size, min_length):
     decoder_start_token_id = tokenizer.bos_token_id
@@ -708,12 +753,9 @@ def train_and_evaluate(model, tokenizer, train_loader, eval_loader, optimizer, s
             writer.add_scalar('EvalSamples', total_samples, global_step)
             writer.add_scalar('EvalTimeSeconds', eval_time, global_step)
 
-            pred = tokenizer.decode(all_predictions[0], skip_special_tokens=True)
-            label = tokenizer.decode(all_labels[0], skip_special_tokens=True)
-            
             print(f"STEP {global_step} • WER:{metrics['wer']:.2f}% • Loss:{loss_avg:.4f} • LR:{lr:.8f}")
-            print(f"PRED: '{pred}'")
-            print(f"REF : '{label}'")
+            print(f"PRED: '{metrics['pred_str'][0]}'")
+            print(f"REF : '{metrics['label_str'][0]}'")
             print()
             logging.info(f"EVALUATION STEP {global_step} - WER: {metrics['wer']:.2f}%, Loss: {loss_avg:.4f}, LR: {lr:.8f}")
             model.train()
@@ -746,6 +788,7 @@ os.makedirs(checkpoint_dir, exist_ok=True)
 log_dir = os.path.join("./output/logs", datetime.now().strftime(format="%m-%d_%H"))
 os.makedirs(name=log_dir, exist_ok=True)
 
+
 # %%
 
 if __name__ == "__main__":
@@ -758,20 +801,19 @@ if __name__ == "__main__":
     logging.basicConfig(
         filename=os.path.join(log_dir, 'training.log'), filemode='w', format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-    token = "" #hugging face token
+    token = ""
+
     dataset = load_dataset(
-        path="google/fleurs",
-        name="en_us",
-        streaming=False,
+        path="mozilla-foundation/common_voice_17_0",
+        name="en",
+        streaming=True,
         token=token,
         trust_remote_code=True,
         cache_dir="E:/cache",
-    ).select_columns(column_names=["audio", "transcription"])
-   
-    debug = None
-    
+    ).select_columns(column_names=["audio", "sentence"]).rename_column("sentence", "transcription")
+
     dims = ModelDimensions(
-        n_mels=80,
+        mels=80,
         n_audio_ctx=1500,
         n_audio_state=512,
         n_audio_head=4,
@@ -781,18 +823,20 @@ if __name__ == "__main__":
         n_text_state=512,
         n_text_head=4,
         n_text_layer=4,
+        decoder_start_token_id = 50258,
+        pad_token_id = tokenizer.pad_token_id,
+        eos_token_id = tokenizer.eos_token_id
     )
-    
-    model = Whisper(dims).to('cuda')
+
+    model = model(dims).to('cuda')
+    model.init_weights()
 
     DataCollator = DataCollator(tokenizer=tokenizer, 
                                 audio_ctx=dims.n_audio_ctx, 
                                 text_ctx=dims.n_text_ctx, 
-                                mels=dims.n_mels,
+                                mels=dims.mels,
                                 n_fft=400,
-                                hop_length=160,
-                                sample_rate=16000, 
-                                device='cuda')
+                                hop_length=160)
 
     train_dataloader = DataLoader(
         dataset=dataset["train"], 
@@ -801,14 +845,14 @@ if __name__ == "__main__":
         num_workers=0)
 
     eval_dataloader = DataLoader(
-        dataset=dataset["test"],
+        dataset=dataset["test"].take(100),
         batch_size=1,
         collate_fn=DataCollator,
         num_workers=0)
     
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.01)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10000, eta_min=1e-5)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=0.01, eps=1e-8, betas=(0.9, 0.98))
-    scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.25, total_iters=10000, last_epoch=-1)
     loss_fn = torch.nn.CrossEntropyLoss(ignore_index=-100)
         
     train_and_evaluate(model=model, 
@@ -823,7 +867,7 @@ if __name__ == "__main__":
         accumulation_steps=1, 
         clear_cache=False, 
         log_interval=10, 
-        eval_interval=500, 
+        eval_interval=100, 
         save_interval=10000, 
         checkpoint_dir=checkpoint_dir, 
         log_dir=log_dir
@@ -837,5 +881,6 @@ tb = program.TensorBoard()
 tb.configure(argv=[None, '--logdir', log_dir])
 url = tb.launch()
 print(f"TensorBoard started at {url}")
+
 
 
